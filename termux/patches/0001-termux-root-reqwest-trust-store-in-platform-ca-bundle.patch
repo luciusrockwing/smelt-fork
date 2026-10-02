@@ -1,0 +1,188 @@
+diff --git a/crates/core/src/http.rs b/crates/core/src/http.rs
+index 925ee71..77e75b0 100644
+--- a/crates/core/src/http.rs
++++ b/crates/core/src/http.rs
+@@ -117,7 +117,7 @@ impl Client {
+         if let Some(client) = clients.get(&max_redirects) {
+             return Ok(client.clone());
+         }
+-        let client = reqwest::Client::builder()
++        let client = smelt_provider::apply_platform_tls(reqwest::Client::builder())
+             .redirect(reqwest::redirect::Policy::limited(max_redirects))
+             .build()
+             .map_err(|err| Error::Client(err.to_string()))?;
+diff --git a/crates/engine/src/agent.rs b/crates/engine/src/agent.rs
+index e3c3296..52eaf90 100644
+--- a/crates/engine/src/agent.rs
++++ b/crates/engine/src/agent.rs
+@@ -138,7 +138,7 @@ pub(crate) async fn engine_task(
+ ) {
+     // Some openai-compatible endpoints gate on User-Agent (e.g. api.kimi.com).
+     // Per-request header() calls (Copilot, Codex) still override this.
+-    let client = reqwest::Client::builder()
++    let client = smelt_provider::apply_platform_tls(reqwest::Client::builder())
+         .user_agent(concat!("smelt/", env!("CARGO_PKG_VERSION")))
+         .build()
+         .unwrap_or_else(|_| reqwest::Client::new());
+diff --git a/crates/provider/src/lib.rs b/crates/provider/src/lib.rs
+index 72c2426..b2678c3 100644
+--- a/crates/provider/src/lib.rs
++++ b/crates/provider/src/lib.rs
+@@ -25,6 +25,7 @@ mod openai;
+ mod pricing;
+ mod response;
+ mod sse;
++mod tls;
+ mod tool;
+ 
+ pub use anthropic_models::{parse_claude_model_version, ClaudeModelFamily, ClaudeModelVersion};
+@@ -75,6 +76,7 @@ pub use response::{
+     collect_indexed_tool_calls, non_empty, non_empty_blocks, sanitize_tool_call_arguments,
+ };
+ pub use response::{ChatResponse, ChatResponseMetadata, CompletedReasoningPart, ParsedResponse};
++pub use tls::apply_platform_tls;
+ pub use tokio_util::sync::CancellationToken;
+ pub use tool::{FunctionSchema, ToolDefinition};
+ 
+diff --git a/crates/provider/src/tls.rs b/crates/provider/src/tls.rs
+new file mode 100644
+index 0000000..e788d1a
+--- /dev/null
++++ b/crates/provider/src/tls.rs
+@@ -0,0 +1,110 @@
++//! Trust-store selection for outbound HTTP.
++//!
++//! reqwest picks a certificate verifier on its own, but its Android choice
++//! assumes a JVM, which a bare Termux process does not have. This module is
++//! the single place where that assumption is corrected.
++
++#[cfg(target_os = "android")]
++use std::path::PathBuf;
++#[cfg(target_os = "android")]
++use std::sync::LazyLock;
++
++/// Fallback for the overwhelmingly common Termux prefix. `$PREFIX` is a runtime
++/// variable, so it cannot be baked in with `env!`.
++#[cfg(target_os = "android")]
++const TERMUX_CA_BUNDLE: &str = "/data/data/com.termux/files/usr/etc/tls/cert.pem";
++
++/// Root the client's trust store in the platform's CA bundle.
++///
++/// On every platform except Android this is the identity function: reqwest
++/// already selects a verifier that works there (webpki-roots, or the OS
++/// verifier via `rustls-native-certs`).
++///
++/// Android is the exception. `rustls-platform-verifier` is the only verifier
++/// reqwest selects there, and it is JVM-backed: its `android.rs` reaches
++/// `GLOBAL.get().expect("Expect rustls-platform-verifier to be initialized")`.
++/// Without a JVM `Context` the first handshake panics instead of returning an
++/// error, so the agent dies on its first network call with a message that
++/// names neither the provider nor the cause. `tls_certs_only` swaps the
++/// platform verifier out for plain webpki rooted at the supplied certificates,
++/// which needs nothing outside this process.
++#[cfg(target_os = "android")]
++pub fn apply_platform_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
++    let certs = android_root_certs();
++    if certs.is_empty() {
++        // Leaving the builder untouched means reqwest keeps
++        // rustls-platform-verifier and panics on the first handshake. That is
++        // the pre-patch behaviour and it is loud, which beats a client that
++        // builds successfully and then fails every request with
++        // UnknownIssuer.
++        return builder;
++    }
++    builder.tls_certs_only(certs.to_vec())
++}
++
++/// Identity function on non-Android targets. See the Android version above.
++#[cfg(not(target_os = "android"))]
++pub fn apply_platform_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
++    builder
++}
++
++/// Parse the CA bundle once per process. Parsing 121 PEM certificates per
++/// client construction is wasteful when a caller rebuilds clients often.
++#[cfg(target_os = "android")]
++static ANDROID_ROOT_CERTS: LazyLock<Vec<reqwest::Certificate>> =
++    LazyLock::new(load_android_root_certs);
++
++#[cfg(target_os = "android")]
++fn android_root_certs() -> &'static [reqwest::Certificate] {
++    &ANDROID_ROOT_CERTS
++}
++
++#[cfg(target_os = "android")]
++fn android_root_certs_path() -> PathBuf {
++    std::env::var_os("SSL_CERT_FILE")
++        .map(PathBuf::from)
++        .or_else(|| {
++            std::env::var_os("PREFIX").map(|prefix| PathBuf::from(prefix).join("etc/tls/cert.pem"))
++        })
++        .unwrap_or_else(|| PathBuf::from(TERMUX_CA_BUNDLE))
++}
++
++#[cfg(target_os = "android")]
++fn load_android_root_certs() -> Vec<reqwest::Certificate> {
++    let path = android_root_certs_path();
++    let parsed = match std::fs::read(&path) {
++        Ok(pem) => reqwest::Certificate::from_pem_bundle(&pem),
++        Err(err) => {
++            eprintln!(
++                "smelt: android TLS roots: could not read {}: {err}",
++                path.display()
++            );
++            return Vec::new();
++        }
++    };
++
++    match parsed {
++        Ok(certs) if !certs.is_empty() => {
++            eprintln!(
++                "smelt: android TLS roots: {} certificates from {}",
++                certs.len(),
++                path.display()
++            );
++            certs
++        }
++        Ok(_) => {
++            eprintln!(
++                "smelt: android TLS roots: {} contained no certificates",
++                path.display()
++            );
++            Vec::new()
++        }
++        Err(err) => {
++            eprintln!(
++                "smelt: android TLS roots: could not parse {}: {err}",
++                path.display()
++            );
++            Vec::new()
++        }
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index d36899c..dbde6b9 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1206,7 +1206,7 @@ async fn async_main() {
+     // context-window fetch) so we only build one rustls config + parse webpki-roots
+     // once. The engine builds its own client because it sets a custom user-agent
+     // for provider request gating.
+-    let startup_http_client = reqwest::Client::builder()
++    let startup_http_client = smelt_provider::apply_platform_tls(reqwest::Client::builder())
+         .user_agent(concat!("smelt/", env!("CARGO_PKG_VERSION")))
+         .build()
+         .unwrap_or_else(|_| reqwest::Client::new());
+diff --git a/src/upgrade.rs b/src/upgrade.rs
+index d4dc3be..0873d47 100644
+--- a/src/upgrade.rs
++++ b/src/upgrade.rs
+@@ -63,7 +63,7 @@ struct CompareCommit {
+ }
+ 
+ pub async fn run_upgrade_command(args: UpgradeArgs) {
+-    let client = reqwest::Client::builder()
++    let client = smelt_provider::apply_platform_tls(reqwest::Client::builder())
+         .user_agent(concat!("smelt-upgrade/", env!("CARGO_PKG_VERSION")))
+         .build()
+         .unwrap_or_else(|_| reqwest::Client::new());

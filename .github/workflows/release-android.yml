@@ -1,0 +1,194 @@
+name: release-android
+
+# Builds smelt for Termux (aarch64-linux-android) and publishes it as a .deb.
+#
+# Upstream smelt ships prebuilt binaries for five desktop targets and none for
+# Android, so a Termux user cannot run the released artifacts: they link glibc
+# or musl and the Bionic loader rejects them. This workflow produces a native
+# aarch64-linux-android build.
+#
+# There is no upstream watcher on purpose. Upstream ships prereleases often, so
+# an automated poller would burn a full ARM build on every alpha. Bump
+# versions.json and dispatch by hand.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (blank = the pin in versions.json)"
+        required: false
+        type: string
+      upstream_ref:
+        description: "Upstream branch or commit instead of the pinned tag (dev build)"
+        required: false
+        type: string
+      draft:
+        description: "Create the release as a draft"
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: "Mark the release as a prerelease (ignored for drafts)"
+        required: false
+        default: true
+        type: boolean
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+      upstream_ref:
+        required: false
+        type: string
+      draft:
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-android
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (aarch64-linux-android)
+    # ARM64 hosted runners are free for public repositories. The build runs in
+    # termux-docker:aarch64, so the container's host triple is already
+    # aarch64-linux-android: no NDK, no cross-linker.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release coordinates
+        id: resolve
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          PINNED="$(python3 -c \
+            "import json;print(json.load(open('versions.json'))['smelt'])")"
+          VERSION="${INPUT_VERSION:-$PINNED}"
+          VERSION="${VERSION#v}"
+
+          if [ -n "$INPUT_UPSTREAM_REF" ]; then
+            # A build from a branch/commit has no upstream tag of its own, so
+            # derive a distinct tag from the run number to avoid collisions.
+            TAG="v${VERSION}-termux.${GITHUB_RUN_NUMBER}"
+            echo "dev build from ${INPUT_UPSTREAM_REF} -> $TAG"
+          else
+            TAG="v$VERSION"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite an existing release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "error: release $TAG already exists; bump versions.json or change the version input" >&2
+            exit 1
+          fi
+
+      - name: Build in Termux container
+        id: build
+        env:
+          SMELT_VERSION: ${{ steps.resolve.outputs.version }}
+          SMELT_UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          SMELT_PROFILE: dist
+        run: |
+          set -euo pipefail
+          bash termux/ci/build-on-runner.sh | tail -n1 > "$RUNNER_TEMP/out-host"
+          OUT_HOST="$(cat "$RUNNER_TEMP/out-host")"
+          echo "out_host=$OUT_HOST" >> "$GITHUB_OUTPUT"
+          ls -la "$OUT_HOST"
+
+      - name: Package .deb
+        env:
+          SMELT_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          OUT_HOST="${{ steps.build.outputs.out_host }}"
+          mkdir -p dist
+          bash termux/ci/package-deb.sh "$OUT_HOST" dist
+          echo "--- BUILD_INFO ---"
+          cat dist/BUILD_INFO
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smelt-android
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: smelt-android
+          path: dist
+
+      - name: Verify checksums
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cd dist
+
+          # Carry upstream's release notes when the pinned tag has them, so the
+          # Termux release does not read as an unexplained empty changelog.
+          NOTES="$(mktemp)"
+          gh release view "v$VERSION" --repo leonardcser/smelt \
+            --json body --jq .body > "$NOTES" 2>/dev/null || true
+          {
+            echo "Termux (aarch64-linux-android) build of smelt."
+            echo
+            echo "Built in termux-docker from the upstream tree plus the patches in"
+            echo "termux/patches/. See BUILD_INFO for the exact commit and toolchain."
+            echo
+            if [ -s "$NOTES" ]; then
+              echo "## Upstream v$VERSION"
+              echo
+              cat "$NOTES"
+            fi
+          } > NOTES.md
+
+          ARGS=(--title "$TAG" --notes-file NOTES.md)
+          # `set -e` makes a false `[ ... ] && ...` the last command of the
+          # script exit non-zero, so these are if-blocks, not one-liners.
+          if [ "$DRAFT" = "true" ]; then
+            ARGS+=(--draft)
+          elif [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          fi
+
+          gh release create "$TAG" smelt_*.deb SHA256SUMS BUILD_INFO "${ARGS[@]}" \
+            --repo "$GITHUB_REPOSITORY"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY"

@@ -1,5 +1,0 @@
----
-source: crates/tui/tests/storybook/mod.rs
-expression: frame.text()
----
-你 好 世 界

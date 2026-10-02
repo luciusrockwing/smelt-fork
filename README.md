@@ -1,90 +1,107 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/docs/logo-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="docs/docs/logo-light.svg">
-    <img src="docs/docs/logo-dark.svg" alt="smelt logo" width="360">
-  </picture>
-</p>
+# smelt-fork
 
-<h1 align="center">smelt</h1>
+Termux builds of [smelt](https://github.com/leonardcser/smelt), a coding agent TUI.
 
-<p align="center">
-  <a href="https://leonardcser.github.io/smelt/">Documentation</a>
-  &nbsp;·&nbsp;
-  <a href="https://leonardcser.github.io/smelt/reference/api/">Lua API</a>
-  &nbsp;·&nbsp;
-  <a href="https://github.com/leonardcser/smelt/releases">Releases</a>
-  &nbsp;·&nbsp;
-  <a href="https://github.com/leonardcser/smelt/issues">Issues</a>
-</p>
+Upstream publishes prebuilt binaries for five desktop targets — Linux x86_64/aarch64,
+macOS x86_64/aarch64, Windows x86_64. None of them run on Android: they link glibc
+or musl, and Android's Bionic loader rejects both. So a Termux user has no way to run
+an official smelt release.
 
-> [!WARNING]
-> smelt is beta software until 1.0. Beta maturity is not encoded as a SemVer
-> prerelease: releases use normal `0.x.y` versions. Use the latest release and
-> update often; interfaces may still change between releases.
+This repo builds smelt natively for `aarch64-linux-android` and publishes it as a
+`.deb` installable with `dpkg -i`.
 
-## Why
+## This repo holds no smelt source
 
-Most coding agents are bloated and hard to customize. smelt is small, fast, and
-scriptable in Lua like Neovim. Built from scratch, with care for the details.
+It is a delta repository, in the style of
+[bd-loser/opencode-bionic](https://github.com/bd-loser/opencode-bionic). Upstream
+source is **not** vendored here. Each build clones upstream at a ref pinned in
+[`versions.json`](versions.json), applies the patches in [`termux/patches/`](termux/patches/),
+and builds the result. The upstream tag is the single source of truth; there is no
+merge to keep up to date.
 
-<p align="center">
-  <img src="assets/demo.gif" alt="demo" width="800">
-</p>
+```
+versions.json                 pin: upstream smelt version + exact commit
+termux/patches/*.patch        the delta
+termux/ci/                    fetch, patch, build, package
+install.sh                    one-line installer
+```
 
-## What's inside
+## Why a container and not a cross-compile
 
-- **Lua plugins.** Keymaps, commands, autocmds, custom tools, and custom modes.
-- **Terminal renderer.** Its own grid and layout engine, not `ratatui`.
-- **Vim editor.** Motions, text objects, registers, undo.
-- **Deterministic fuzzing.** Fixed clock and stubbed I/O, so any crash can be
-  replayed.
-- **No config needed.** Run with flags, or use `smelt auth` for ChatGPT, GitHub
-  Copilot, and Kimi Code.
+The build runs inside `termux/termux-docker:aarch64` on a `ubuntu-24.04-arm` runner.
+That runner is already aarch64, so inside the container `rustc`'s host triple *is*
+`aarch64-linux-android`. There is no NDK, no cross-linker, and no API-level pinning —
+the toolchain is the same one Termux users already have, so a binary built here runs
+on a real device without an ABI mismatch.
+
+ARM64 hosted runners are free for public repositories.
+
+## The delta
+
+One patch: `0001-termux-root-reqwest-trust-store-in-platform-ca-bundle.patch`.
+
+On Android, `reqwest` selects `rustls-platform-verifier` as its only available
+certificate verifier. That verifier is JVM-backed — it reaches
+`GLOBAL.get().expect("Expect rustls-platform-verifier to be initialized")`. A bare
+Termux process has no JVM, so the **first HTTPS handshake panics** and takes the agent
+down with a message that names neither the provider nor the cause.
+
+The patch adds `smelt_provider::apply_platform_tls`, the identity function on every
+platform except Android, where it switches `reqwest` to `tls_certs_only` with the CA
+bundle from `$SSL_CERT_FILE`, `$PREFIX/etc/tls/cert.pem`, or the Termux default.
+All four `reqwest::Client::builder()` sites route through it. No new dependencies, so
+`Cargo.lock` stays valid and `--locked` keeps working.
 
 ## Install
 
-Prebuilt Linux and macOS binaries for x86_64 and aarch64, plus Windows x86_64,
-are on the [Releases](https://github.com/leonardcser/smelt/releases) page. Extract
-the archive and put `smelt` (`smelt.exe` on Windows) on your `PATH`, or install
-from source:
-
-```bash
-cargo install --locked --git https://github.com/leonardcser/smelt.git smelt-agent
+```sh
+curl -fsSL https://raw.githubusercontent.com/luciusrockwing/smelt-fork/main/install.sh | bash
 ```
 
-## Run
+Pin a specific release:
 
-**Subscription providers** (ChatGPT Pro/Plus, GitHub Copilot, Kimi Code):
-
-```bash
-smelt auth                          # one-time login
-smelt                               # provider auto-detected from credentials
+```sh
+curl -fsSL .../install.sh | SMELT_VERSION=0.5.0-alpha.13 bash
 ```
 
-**API-key providers** (any OpenAI-compatible endpoint):
+Only `aarch64` is built.
 
-```bash
-# local model via Ollama
-smelt --model qwen3.6:27b --api-base http://localhost:11434/v1
+## Releasing a new version
 
-# OpenAI, Anthropic, OpenRouter, etc.
-smelt --model gpt-5.5 --api-base https://api.openai.com/v1 --api-key-env OPENAI_API_KEY
-```
+1. Update the `smelt` version and `smeltCommit` in `versions.json`. `smeltCommit` is
+   what `git ls-remote` reports for that tag; the build aborts if the tag resolves to
+   anything else, so a moved upstream tag cannot slip through silently.
+2. Refresh the patch against the new tree (`git format-patch` from a clone of that tag
+   with the changes applied). Patches are applied with `git am --3way`, so an upstream
+   edit near a hunk three-way merges instead of failing outright.
+3. Dispatch **release-android** from the Actions tab, or:
+   ```sh
+   gh workflow run release-android.yml -f version=0.5.0-alpha.14
+   ```
 
-Or just run `smelt` with no arguments and follow the wizard. The default mode
-cycle is Normal → Plan → Apply → Yolo. Plan mode is bundled and autoloaded.
-Optional bundled plugins include `which_key`, the local request inspector, and
-LSP-backed semantic code tools; enable them from `~/.config/smelt/init.lua`.
+There is deliberately **no upstream watcher**. Upstream ships prereleases often, so an
+automated poller would spend a full ARM build on every alpha. Dispatch is manual.
 
-## Docs
+Use `upstream_ref` to build a branch or commit instead of the pinned tag; that produces
+a `v<version>-termux.<run>` tag so it cannot collide with a release build.
 
-Full documentation for configuration, Lua API, keybindings, permissions,
-providers, and plugin authoring lives at
-**[leonardcser.github.io/smelt](https://leonardcser.github.io/smelt/)**.
+## Layout of a build
+
+| Step | Script |
+| --- | --- |
+| clone upstream at the pinned ref | `termux/ci/fetch-upstream.sh` |
+| apply the delta, drop `rust-toolchain.toml` | `termux/ci/apply-patches.sh` |
+| both of the above | `termux/ci/prepare-build-tree.sh` |
+| run the container | `termux/ci/build-on-runner.sh` |
+| compile inside Termux | `termux/ci/build-in-container.sh` |
+| build the `.deb` + `SHA256SUMS` | `termux/ci/package-deb.sh` |
+
+`apply-patches.sh` removes `rust-toolchain.toml` from the build tree. That file is a
+rustup-only mechanism, and rustup publishes no `aarch64-linux-android` *host* toolchain
+at all, so it can only ever misdirect a toolchain manager. Termux supplies `rustc` and
+`cargo` from the `termux-main` repository.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Inspired by
-[Claude Code](https://github.com/anthropics/claude-code) and
-[Neovim](https://github.com/neovim/neovim).
+smelt is MIT licensed; see [`LICENSE`](LICENSE). The patches here are distributed under
+the same terms.

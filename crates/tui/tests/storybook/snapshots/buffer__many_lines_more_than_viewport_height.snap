@@ -1,7 +1,0 @@
----
-source: crates/tui/tests/storybook/mod.rs
-expression: frame.text()
----
-row 01
-row 02
-row 03

@@ -1,5 +1,0 @@
----
-source: crates/tui/tests/storybook/mod.rs
-expression: frame.text()
----
-a b c d e f g h

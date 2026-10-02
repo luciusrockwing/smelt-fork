@@ -1,5 +1,0 @@
----
-source: crates/term/tests/storybook/mod.rs
-expression: frame.styles_text()
----
-dim: 18 5

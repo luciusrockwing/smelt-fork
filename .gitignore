@@ -1,13 +1,13 @@
+# Upstream builds into target/; so does anyone running termux/ci by hand.
 target/
-docs/site/
+
+# Local artifact output from a manual termux/ci run.
+#
+# The CI build itself clones upstream into $HOME/smelt and writes to /out, so
+# nothing in this repo is ever a build directory. These only appear when the
+# pipeline is exercised by hand.
+out/
+dist/
+
 __pycache__/
-# samply / local CPU profile captures
 *.json.gz
-# RALPH loop sentinels — written by the agent at the end of an iteration,
-# read by refactor/ralph.sh, never committed.
-refactor/.ralph-done
-refactor/.ralph-needs-input
-# Ignore everything under .claude/ (per-machine settings, runtime state, etc.)
-# *except* project-wide skills, which are checked in.
-.claude/*
-!.claude/skills/

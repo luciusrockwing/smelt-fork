@@ -1,7 +1,0 @@
----
-source: crates/tui/tests/storybook/mod.rs
-expression: frame.text()
----
-alpha bravo charlie
-delta echo foxtrot
-golf hotel india

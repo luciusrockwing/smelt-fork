@@ -1,8 +1,0 @@
----
-source: crates/tui/tests/storybook/mod.rs
-assertion_line: 187
-expression: frame.text()
----
-alpha
-alpha
-beta

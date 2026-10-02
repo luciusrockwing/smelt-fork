@@ -41,13 +41,20 @@ echo "deb https://packages.termux.dev/apt/termux-main stable main" \
   > "${PREFIX:-/data/data/com.termux/files/usr}/etc/apt/sources.list"
 apt update -y
 # git + ca-certificates to clone upstream, python to read versions.json, the
-# clang/lld/cmake/ninja toolchain that rustc and the native build scripts
-# (aws-lc-sys, libsqlite3-sys, mlua-sys, onig_sys, zstd-sys) need.
-apt install -y git ca-certificates python clang lld cmake make ninja pkg-config
+# clang/lld/cmake/ninja/binutils toolchain that rustc and the native build
+# scripts (aws-lc-sys, libsqlite3-sys, mlua-sys, onig_sys, zstd-sys) need, and
+# rust itself: termux-docker ships no Rust, and rustup publishes no
+# aarch64-linux-android *host* toolchain, so pkg rust is the only rustc here.
+apt install -y git ca-certificates python clang lld cmake make ninja \
+  pkg-config binutils rust
 
-# The whole point of building in here rather than cross-compiling: the host
-# triple is already the target triple, so there is no NDK and no cross-linker.
+# An apt install that resolves to "nothing to do" still exits 0, so assert on
+# the tools themselves rather than trusting the exit status.
 echo "=== toolchain ==="
+for tool in git python3 cc cmake ninja ar cargo rustc; do
+  command -v "$tool" >/dev/null 2>&1 \
+    || die "required tool missing after apt install: $tool"
+done
 rustc --version --verbose
 case "$(rustc -vV | sed -n 's/^host: //p')" in
   aarch64-linux-android) ;;
